@@ -1,6 +1,6 @@
 # Markdown2Medium Converter
 
-![Screenshot](public/image.png)
+![Screenshot](public/markdown2medium.png)
 
 A powerful tool that converts Markdown to Medium-compatible text. Perfect for writers who want to maintain their workflow in Markdown while publishing to Medium.
 

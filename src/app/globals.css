@@ -72,30 +72,46 @@ body {
 }
 
 
-.medium-preview .graf--h1 {
+.graf--h1 {
   @apply text-4xl font-bold mt-8 mb-6;
 }
 
-.medium-preview .graf--h2 {
+.graf--h2 {
   @apply text-3xl font-bold mt-6 mb-4;
 }
 
-.medium-preview .graf--h3 {
+.graf--h3 {
   @apply text-2xl font-semibold mt-4 mb-3;
 }
 
-.medium-preview .graf--p {
+.graf--p {
   @apply text-lg mb-4 leading-relaxed;
 }
 
-.medium-preview .graf--blockquote {
+.graf--blockquote {
   @apply border-l-4 border-gray-300 pl-4 my-6 text-gray-600 italic;
 }
 
-.medium-preview .graf--pre {
+.graf--pre {
   @apply bg-muted p-4 rounded-lg overflow-x-auto my-6;
 }
 
-.medium-preview .graf--li {
+.graf--li {
   @apply list-disc ml-6 mb-2;
+}
+
+[data-radix-dialog-content] {
+  * {
+    user-select: none;
+    
+    .select-text {
+      user-select: text;
+      -webkit-user-select: text;
+      
+      * {
+        user-select: text;
+        -webkit-user-select: text;
+      }
+    }
+  }
 }
