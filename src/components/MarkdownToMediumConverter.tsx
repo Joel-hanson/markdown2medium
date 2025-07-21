@@ -320,24 +320,23 @@ Start editing this text or paste your own Markdown content.
                 if (tables.length > 0) {
                     setTableData(processTablesForGist(tables));
 
-                    // Replace tables in the HTML based on the selected method
-                    tables.forEach((tableRows, index) => {
-                        const tableHtml = createTableHtml(tableRows);
+                    // Replace all tables at once
+                    let tableIndex = 0;
+                    mediumHtml = mediumHtml.replace(/<table[^>]*>[\s\S]*?<\/table>/gi, (match) => {
+                        const currentIndex = tableIndex++;
 
                         if (tableHandlingMethod === 'gist') {
                             // Replace with Gist placeholder
-                            const gistPlaceholder = generateGistPlaceholder(index + 1);
-                            mediumHtml = mediumHtml.replaceAll("\n", "").replace(tableHtml, gistPlaceholder);
-
+                            return generateGistPlaceholder(currentIndex + 1);
                         } else if (tableHandlingMethod === 'image') {
-                            // We'll handle image conversion separately
-                            // Just mark the tables for now
-                            const imagePlaceholder = `<div data-table-index="table-${index + 1}" class="table-image-placeholder">
-                                <p>Table ${index + 1} will be converted to an image</p>
+                            // Replace with image placeholder
+                            return `<div data-table-index="table-${currentIndex + 1}" class="table-image-placeholder">
+                                <p>Table ${currentIndex + 1} will be converted to an image</p>
                             </div>`;
-
-                            mediumHtml = mediumHtml.replaceAll("\n", "").replace(tableHtml, imagePlaceholder);
                         }
+
+                        // This shouldn't happen, but return the original if it does
+                        return match;
                     });
                 }
             }
@@ -449,7 +448,7 @@ Start editing this text or paste your own Markdown content.
                     //     <img src="${dataUrl}" alt="Table ${image.tableIndex}" class="graf graf--image" />
                     // </div>`;
 
-                    updatedHtml = updatedHtml.replaceAll("\n", "").replace(
+                    updatedHtml = updatedHtml.replace(
                         new RegExp(placeholder + '.*?</div>', 's'),
                         imageHtml
                     );
@@ -509,6 +508,68 @@ Start editing this text or paste your own Markdown content.
         });
 
         setShowGistInstructions(true);
+    }, [tableData, toast]);
+
+    const createGistForTable = useCallback((tableIndex: number): void => {
+        if (!tableData[tableIndex]) return;
+
+        const table = tableData[tableIndex];
+
+        // Copy table content to clipboard
+        navigator.clipboard.writeText(table.content).then(() => {
+            toast({
+                title: "Table content copied!",
+                description: `Table ${tableIndex + 1} content is ready to paste into GitHub Gist`,
+                duration: 4000,
+            });
+        });
+
+        // Open GitHub Gist in new tab with pre-filled filename
+        const gistUrl = new URL('https://gist.github.com/');
+        const newWindow = window.open(gistUrl.toString(), '_blank');
+
+        if (newWindow) {
+            // Add instructions for the user
+            setTimeout(() => {
+                toast({
+                    title: "Instructions",
+                    description: "Paste the copied content in the new GitHub Gist tab, then copy the embed code back here",
+                    duration: 6000,
+                });
+            }, 1000);
+        }
+    }, [tableData, toast]);
+
+    const openAllGistCreations = useCallback((): void => {
+        if (!tableData.length) {
+            toast({
+                title: "No tables found",
+                description: "No table content available",
+                variant: "destructive",
+                duration: 3000,
+            });
+            return;
+        }
+
+        // Copy all table data to clipboard as JSON for easy reference
+        const allTablesData = tableData.map((table, index) => ({
+            tableNumber: index + 1,
+            filename: table.filename,
+            content: table.content
+        }));
+
+        navigator.clipboard.writeText(JSON.stringify(allTablesData, null, 2));
+
+        // Open GitHub Gist
+        window.open('https://gist.github.com/', '_blank');
+
+        setShowGistInstructions(true);
+
+        toast({
+            title: "All table data copied!",
+            description: "Table data is in your clipboard. Create gists and follow the instructions in the dialog.",
+            duration: 5000,
+        });
     }, [tableData, toast]);
 
     return (
@@ -601,23 +662,14 @@ Start editing this text or paste your own Markdown content.
                             </div>
                         </div>
 
-                        <div>
-                            <h3 className="font-semibold mb-3">Tables</h3>
-                            <div className="space-y-2 text-sm">
-                                <p><code>| Header | Header |</code></p>
-                                <p><code>| ------ | ------ |</code></p>
-                                <p><code>| Cell   | Cell   |</code></p>
-                            </div>
-                        </div>
-
                         <div className="col-span-1 md:col-span-2">
                             <h3 className="font-semibold mb-3">Table Example</h3>
                             <div className="space-y-2 text-sm">
                                 <pre className="bg-gray-100 p-2 rounded dark:bg-gray-800 overflow-auto text-sm leading-5 whitespace-pre">
-                                    | Name  | Role     | Department |
-                                    | ----- | -------- | ---------- |
-                                    | John  | Manager  | Sales      |
-                                    | Alice | Engineer | DevOps     |
+                                    {`| Name  | Role     | Department |
+| ----- | -------- | ---------- |
+| John  | Manager  | Sales      |
+| Alice | Engineer | DevOps     |`}
                                 </pre>
                                 <p className="text-muted-foreground mt-2">
                                     💡 Tip: Make sure there are at least 3 dashes in each column of the separator row.
@@ -714,29 +766,105 @@ Start editing this text or paste your own Markdown content.
 
             {/* GitHub Gist Instructions Dialog */}
             <Dialog open={showGistInstructions} onOpenChange={setShowGistInstructions}>
-                <DialogContent className="sm:max-w-2xl">
+                <DialogContent className="sm:max-w-4xl max-h-[90vh] overflow-y-auto">
                     <DialogHeader>
                         <DialogTitle className="flex items-center gap-2">
                             <Github className="h-5 w-5" />
-                            GitHub Gist Embedding Instructions
+                            GitHub Gist Creation Assistant
                         </DialogTitle>
                         <DialogDescription>
-                            Follow these steps to embed your tables as GitHub Gists
+                            Create GitHub Gists for your tables with these improved tools
                         </DialogDescription>
                     </DialogHeader>
                     <div className="space-y-6 py-4">
+                        {/* Quick Actions */}
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <Button
+                                onClick={openAllGistCreations}
+                                className="w-full flex items-center gap-2"
+                            >
+                                <Github className="h-4 w-4" />
+                                Open GitHub Gist & Copy All Tables
+                            </Button>
+                            <Button
+                                onClick={downloadAllTablesAsGist}
+                                variant="outline"
+                                className="w-full flex items-center gap-2"
+                            >
+                                <Download className="h-4 w-4" />
+                                Download Table Files (Backup)
+                            </Button>
+                        </div>
+
+                        {/* Individual Table Actions */}
+                        {tableData.length > 0 && (
+                            <div>
+                                <h3 className="font-semibold mb-3">Individual Table Actions</h3>
+                                <div className="grid gap-3">
+                                    {tableData.map((table, index) => (
+                                        <div key={table.id} className="flex items-center justify-between p-3 border rounded-md">
+                                            <div>
+                                                <h4 className="font-medium">Table {index + 1}</h4>
+                                                <p className="text-sm text-muted-foreground">{table.filename}</p>
+                                                <p className="text-xs text-muted-foreground mt-1">
+                                                    {table.content.split('\n').length} lines
+                                                </p>
+                                            </div>
+                                            <div className="flex gap-2">
+                                                <Button
+                                                    size="sm"
+                                                    variant="outline"
+                                                    onClick={() => {
+                                                        navigator.clipboard.writeText(table.content);
+                                                        toast({
+                                                            title: "Copied!",
+                                                            description: `Table ${index + 1} content copied to clipboard`,
+                                                            duration: 2000,
+                                                        });
+                                                    }}
+                                                >
+                                                    <Copy className="h-3 w-3 mr-1" />
+                                                    Copy
+                                                </Button>
+                                                <Button
+                                                    size="sm"
+                                                    onClick={() => createGistForTable(index)}
+                                                >
+                                                    Create Gist
+                                                </Button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
                         <div className="space-y-4">
                             <div className="flex items-start gap-4">
                                 <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">1</span>
                                 <div>
-                                    <h3 className="font-semibold">Create GitHub Gists</h3>
+                                    <h3 className="font-semibold">Create GitHub Gists (Automated)</h3>
                                     <p className="text-sm text-muted-foreground my-2">
-                                        Go to <a href="https://gist.github.com" target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline">gist.github.com</a> and create a new gist for each table markdown file you downloaded.
+                                        Click &quot;Create Gist&quot; for each table above, or use &quot;Open GitHub Gist & Copy All Tables&quot; to handle all at once.
+                                        The table content will be automatically copied to your clipboard.
                                     </p>
                                 </div>
                             </div>
                             <div className="flex items-start gap-4">
                                 <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">2</span>
+                                <div>
+                                    <h3 className="font-semibold">Paste and Create Gist</h3>
+                                    <p className="text-sm text-muted-foreground my-2">
+                                        In the opened GitHub Gist tab:
+                                        • Paste the copied content (Ctrl/Cmd + V)
+                                        • Set the filename (e.g., &quot;table-1.md&quot;)
+                                        • Make it public or secret as preferred
+                                        • Click &quot;Create public gist&quot; or &quot;Create secret gist&quot;
+                                    </p>
+                                </div>
+                            </div>
+                            <div className="flex items-start gap-4">
+                                <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">3</span>
                                 <div>
                                     <h3 className="font-semibold">Get the embed code</h3>
                                     <p className="text-sm text-muted-foreground my-2">
@@ -745,11 +873,11 @@ Start editing this text or paste your own Markdown content.
                                 </div>
                             </div>
                             <div className="flex items-start gap-4">
-                                <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">3</span>
+                                <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">4</span>
                                 <div>
                                     <h3 className="font-semibold">Replace the placeholders</h3>
                                     <p className="text-sm text-muted-foreground my-2">
-                                        In the copied HTML, find the placeholder divs for tables and replace them with the gist embed code.
+                                        In your copied HTML, find the placeholder divs for tables and replace them with the gist embed codes.
                                     </p>
                                 </div>
                             </div>
@@ -760,6 +888,9 @@ Start editing this text or paste your own Markdown content.
                             <pre className="text-xs p-2 bg-gray-100 dark:bg-gray-900 rounded overflow-x-auto">
                                 {'<div class="gist-embed-placeholder">\n  <p><strong>Table 1</strong> - Create a GitHub Gist with this content</p>\n  <p class="text-sm text-muted-foreground">\n    Replace this placeholder with a GitHub Gist embed\n  </p>\n</div>'}
                             </pre>
+                            <p className="text-sm text-muted-foreground mt-2">
+                                Replace this entire div with: <code>&lt;script src=&quot;https://gist.github.com/username/gist-id.js&quot;&gt;&lt;/script&gt;</code>
+                            </p>
                         </div>
                     </div>
                     <DialogFooter>
@@ -882,7 +1013,7 @@ Start editing this text or paste your own Markdown content.
                                 <CardDescription>Get your content ready for Medium</CardDescription>
                             </CardHeader>
                             <CardContent className="space-y-4">
-                                <Button onClick={copyHtmlToClipboard} className="w-full flex items-center gap-2 hidden" disabled={!htmlOutput}>
+                                <Button onClick={copyHtmlToClipboard} className="w-full flex items-center gap-2" disabled={!htmlOutput}>
                                     <Copy className="h-4 w-4" />
                                     {copied ? "Copied!" : "Copy HTML"}
                                 </Button>
@@ -897,12 +1028,12 @@ Start editing this text or paste your own Markdown content.
 
                                 {tableHandlingMethod === 'gist' && tableData.length > 0 && (
                                     <Button
-                                        onClick={downloadAllTablesAsGist}
+                                        onClick={openAllGistCreations}
                                         variant="secondary"
                                         className="w-full flex items-center gap-2"
                                     >
                                         <Github className="h-4 w-4" />
-                                        Export Tables for Gist
+                                        Create GitHub Gists
                                     </Button>
                                 )}
                             </CardContent>
