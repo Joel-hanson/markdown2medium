@@ -1,7 +1,8 @@
 "use client"
 
+import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Label } from '@/components/ui/label';
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
@@ -9,30 +10,29 @@ import { Separator } from '@/components/ui/separator';
 import { Switch } from '@/components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { useToast } from "@/hooks/use-toast";
-import { elementToSVG } from 'dom-to-svg';
 import DOMPurify from 'dompurify';
 import html2canvas from 'html2canvas';
 import {
-    AlertCircle,
+    Check,
+    ChevronDown,
     Code2,
     Copy,
     Download,
     Eye,
     Github,
     HelpCircle,
-    Image as ImageIcon,
+    Info,
+    Loader2,
     Maximize,
-    Rocket,
-    Table,
     X
 } from 'lucide-react';
 import { marked } from 'marked';
 import Image from 'next/image';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
 
-// Define TypeScript interfaces
+type TableMode = 'plain' | 'image' | 'gist';
+
 interface TableData {
     id: string;
     content: string;
@@ -41,425 +41,583 @@ interface TableData {
 
 interface TableImage {
     dataUrl: string;
-    svg: string;
     tableIndex: string;
 }
 
-type TableHandlingMethod = 'html' | 'gist' | 'image';
+const SAMPLE_MARKDOWN = `# Your Medium draft
+
+Write in Markdown, then copy and paste into Medium.
+
+## Formatting that works
+
+**Bold**, *italic*, and [links](https://medium.com) all come through.
+
+> Blockquotes look like this.
+
+\`\`\`javascript
+function hello() {
+  return "Hello, Medium";
+}
+\`\`\`
+
+### Nested section
+
+Medium only has two heading styles. Your top heading level becomes Header (large T); the next level down becomes Subheader (small T).
+
+### Tables
+
+Medium does not support HTML tables. By default they paste as readable text:
+
+| Feature | Works |
+| ------- | ----- |
+| Headings | Yes |
+| Lists | Yes |
+| Code | Yes |
+| Tables | As text |
+
+Start editing, or clear this and paste your own Markdown.
+`;
+
+const stripFrontmatter = (content: string): string =>
+    content.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '');
+
+const isMarkdownTableSeparator = (line: string): boolean =>
+    /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/.test(line.trim());
+
+const extractTablesFromMarkdown = (markdownText: string): string[][] => {
+    const lines = markdownText.split('\n');
+    const tables: string[][] = [];
+    let currentTable: string[] = [];
+    let inTable = false;
+    let inFence = false;
+
+    const flushTable = () => {
+        if (
+            currentTable.length >= 2 &&
+            currentTable.some(isMarkdownTableSeparator)
+        ) {
+            tables.push([...currentTable]);
+        }
+        currentTable = [];
+        inTable = false;
+    };
+
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
+
+        if (trimmed.startsWith('```')) {
+            if (inTable) flushTable();
+            inFence = !inFence;
+            continue;
+        }
+        if (inFence) continue;
+
+        if (trimmed.includes('|')) {
+            if (!inTable) {
+                inTable = true;
+                currentTable = [];
+            }
+            currentTable.push(trimmed);
+        } else if (inTable) {
+            flushTable();
+        }
+    }
+
+    if (inTable) flushTable();
+    return tables;
+};
+
+const parseMarkdownTableRows = (tableRows: string[]): string[][] =>
+    tableRows
+        .map((row) => row.trim())
+        .filter((row) => row.length > 0 && !/^\|?\s*[-:| ]+\s*\|?$/.test(row))
+        .map((row) =>
+            row
+                .replace(/^\||\|$/g, '')
+                .split('|')
+                .map((cell) => cell.trim())
+        );
+
+const escapeHtml = (text: string): string =>
+    text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+
+const isUsableImageSrc = (src: string): boolean => {
+    const value = src.trim();
+    if (!value) return false;
+    if (/^(javascript|data|blob|vbscript):/i.test(value)) return false;
+    if (/^https?:\/\//i.test(value)) return true;
+    if (value.startsWith('/') || value.startsWith('./') || value.startsWith('../')) return true;
+    // Relative path without a scheme (e.g. images/cover.png)
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(value)) return true;
+    return false;
+};
+
+/** Plain text for labels / image-mode table cells. */
+const stripCellMarkdown = (cell: string): string =>
+    cell
+        .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/__([^_]+)__/g, '$1')
+        .replace(/\*([^*]+)\*/g, '$1')
+        .replace(/(^|[\s(])_([^_]+)_([\s).,!?]|$)/g, '$1$2$3')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+/** Keep links, bold, italic, and code in table cells as HTML. */
+const cellMarkdownToHtml = (cell: string): string => {
+    let s = cell.trim();
+    if (!s) return '';
+
+    const tokens: string[] = [];
+    const stash = (html: string): string => {
+        tokens.push(html);
+        return `\u0000${tokens.length - 1}\u0000`;
+    };
+
+    s = s.replace(/!\[([^\]]*)\]\(([^)]*)\)/g, (_m, alt: string, src: string) => {
+        const label = (alt || 'Image').trim();
+        if (!isUsableImageSrc(src)) {
+            return stash(`<em>[${escapeHtml(label)}]</em>`);
+        }
+        return stash(
+            `<img src="${escapeHtml(src.trim())}" alt="${escapeHtml(label)}" />`
+        );
+    });
+
+    s = s.replace(/\[([^\]]+)\]\(([^)]*)\)/g, (_m, text: string, href: string) => {
+        const label = text.trim();
+        const url = href.trim();
+        if (!url) return escapeHtml(label);
+        return stash(`<a href="${escapeHtml(url)}">${escapeHtml(label)}</a>`);
+    });
+
+    s = s.replace(/\*\*([^*]+)\*\*/g, (_m, text: string) =>
+        stash(`<strong>${escapeHtml(text)}</strong>`)
+    );
+    s = s.replace(/__([^_]+)__/g, (_m, text: string) =>
+        stash(`<strong>${escapeHtml(text)}</strong>`)
+    );
+    s = s.replace(/\*([^*]+)\*/g, (_m, text: string) =>
+        stash(`<em>${escapeHtml(text)}</em>`)
+    );
+    s = s.replace(/(^|[\s(])_([^_]+)_([\s).,!?]|$)/g, (_m, before: string, text: string, after: string) =>
+        `${before}${stash(`<em>${escapeHtml(text)}</em>`)}${after}`
+    );
+    s = s.replace(/`([^`]+)`/g, (_m, text: string) =>
+        stash(`<code>${escapeHtml(text)}</code>`)
+    );
+
+    s = escapeHtml(s);
+    s = s.replace(/\u0000(\d+)\u0000/g, (_m, index: string) => tokens[Number(index)] || '');
+    return s;
+};
+
+const imageMissingPlaceholder = (alt: string): string =>
+    `<p class="image-missing"><em>[${escapeHtml(alt || 'Image unavailable')}]</em></p>`;
+
+/** Replace empty / data / unusable images with a readable placeholder. */
+const normalizeDocumentImages = (html: string): string =>
+    html.replace(/<img\b([^>]*)\/?>/gi, (_match, attrs: string) => {
+        const src = attrs.match(/\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+        const alt = attrs.match(/\balt\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+        const srcValue = (src?.[1] || src?.[2] || src?.[3] || '').trim();
+        const altValue = (alt?.[1] || alt?.[2] || alt?.[3] || 'Image unavailable').trim();
+
+        if (!isUsableImageSrc(srcValue)) {
+            return imageMissingPlaceholder(altValue);
+        }
+
+        return `<img src="${escapeHtml(srcValue)}" alt="${escapeHtml(altValue)}" class="graf graf--image" />`;
+    });
+
+/**
+ * Medium can't show HTML tables, and wide ASCII grids truncate in code blocks.
+ * Emit stacked paragraphs that read cleanly and wrap on Medium.
+ */
+const formatTableAsMediumHtml = (rows: string[][]): string => {
+    if (!rows.length) return '';
+
+    const headers = rows[0].map(stripCellMarkdown);
+    const rawBody = rows.slice(1);
+
+    if (!rawBody.length) return '';
+
+    // Two columns → bold label + description (most common Medium case)
+    if (headers.length === 2) {
+        return rawBody
+            .map((row) => {
+                const key = cellMarkdownToHtml(row[0] || '');
+                const val = cellMarkdownToHtml(row[1] || '');
+                if (!key && !val) return '';
+                if (!val) return `<p class="table-row"><span class="table-row-label">${key}</span></p>`;
+                return `<p class="table-row"><span class="table-row-label">${key}</span><br>${val}</p>`;
+            })
+            .filter(Boolean)
+            .join('\n');
+    }
+
+    // 3+ columns → labeled lines per row
+    return rawBody
+        .map((row) => {
+            const lines = headers
+                .map((header, i) => {
+                    const value = cellMarkdownToHtml(row[i] || '');
+                    if (!value) return '';
+                    return `<strong>${escapeHtml(header)}:</strong> ${value}`;
+                })
+                .filter(Boolean);
+            if (!lines.length) return '';
+            return `<p>${lines.join('<br>')}</p>`;
+        })
+        .filter(Boolean)
+        .join('\n');
+};
+
+const markdownTableToPlainHtml = (tableRows: string[]): string =>
+    formatTableAsMediumHtml(parseMarkdownTableRows(tableRows));
+
+const replaceTablesWithPlain = (html: string, tables: string[][]): string => {
+    let tableIndex = 0;
+    return html.replace(/<table[^>]*>[\s\S]*?<\/table>/gi, () => {
+        const tableRows = tables[tableIndex++];
+        if (!tableRows) return '';
+        return markdownTableToPlainHtml(tableRows);
+    });
+};
+
+const processTablesForGist = (tables: string[][]): TableData[] =>
+    tables.map((tableRows, index) => ({
+        id: `table-${index + 1}`,
+        content: tableRows.join('\n'),
+        filename: `table-${index + 1}.md`,
+    }));
+
+const createTableHtml = (tableRows: string[]): string => {
+    if (!tableRows || tableRows.length < 2) return '';
+
+    const rows = parseMarkdownTableRows(tableRows).map((row) =>
+        row.map(stripCellMarkdown)
+    );
+    if (rows.length < 1) return '';
+
+    const headerRow = rows[0];
+    let html = '<table><thead><tr>';
+    headerRow.forEach((cell) => {
+        html += `<th>${escapeHtml(cell)}</th>`;
+    });
+    html += '</tr></thead><tbody>';
+
+    for (let i = 1; i < rows.length; i++) {
+        html += '<tr>';
+        headerRow.forEach((_, col) => {
+            html += `<td>${escapeHtml(rows[i][col] || '')}</td>`;
+        });
+        html += '</tr>';
+    }
+
+    html += '</tbody></table>';
+    return html;
+};
+
+const generateGistPlaceholder = (tableIndex: number): string => `
+<div class="gist-embed-placeholder rounded border border-dashed border-neutral-300 bg-neutral-50 p-4 my-6 text-center">
+  <p class="font-medium text-neutral-800 m-0"><strong>Table ${tableIndex}</strong> — create a GitHub Gist</p>
+  <p class="text-sm text-neutral-500 mt-2 mb-0">Replace this placeholder with a Gist embed after creating it.</p>
+</div>`;
+
+const convertTableToImage = async (tableHtml: string, tableIndex: string): Promise<TableImage | null> => {
+    try {
+        const container = document.createElement('div');
+        container.style.position = 'absolute';
+        container.style.left = '-9999px';
+        container.style.padding = '20px';
+        container.style.background = 'white';
+        container.style.width = '800px';
+        container.style.fontFamily = 'Arial, sans-serif';
+        container.innerHTML = `
+            <style>
+                table { border-collapse: collapse; width: 100%; }
+                th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+                th { background-color: #f2f2f2; font-weight: bold; }
+                tr:nth-child(even) { background-color: #f9f9f9; }
+            </style>
+            ${tableHtml}
+        `;
+
+        document.body.appendChild(container);
+        const canvas = await html2canvas(container);
+        document.body.removeChild(container);
+
+        return {
+            dataUrl: canvas.toDataURL('image/png'),
+            tableIndex,
+        };
+    } catch (error) {
+        console.error('Error converting table to image:', error);
+        return null;
+    }
+};
+
+// Medium splits a single <pre> into multiple code blocks when it sees blank
+// lines inside. Replace empty lines with a non-breaking space so paste stays one block.
+const preserveCodeBlockBlankLines = (html: string): string =>
+    html.replace(/<pre(\b[^>]*)>([\s\S]*?)<\/pre>/gi, (_match, attrs: string, content: string) => {
+        const fixed = content
+            .split('\n')
+            .map((line) => (line.trim() === '' ? '&nbsp;' : line))
+            .join('\n');
+        return `<pre${attrs}>${fixed}</pre>`;
+    });
+
+const applyMediumClasses = (html: string): string =>
+    html
+        .replace(/<h1/g, '<h1 class="graf graf--h1"')
+        .replace(/<h2/g, '<h2 class="graf graf--h2"')
+        .replace(/<h3/g, '<h3 class="graf graf--h3"')
+        .replace(/<p>/g, '<p class="graf graf--p">')
+        .replace(/<blockquote>/g, '<blockquote class="graf graf--blockquote">')
+        .replace(/<pre>/g, '<pre class="graf graf--pre">')
+        .replace(/<code/g, '<code class="markup--code markup--pre-code"')
+        .replace(/<ul>/g, '<ul class="postList graf graf--ul">')
+        .replace(/<li>/g, '<li class="graf graf--li">')
+        .replace(/<strong>/g, '<strong class="markup--strong markup--p-strong">')
+        .replace(/<em>/g, '<em class="markup--em markup--p-em">')
+        .replace(/<img/g, '<img class="graf graf--image"');
+
+/**
+ * Medium only has two heading styles in the editor:
+ *   large T (Header)  ← pasted as h1
+ *   small T (Subheader) ← pasted as h4
+ * (Pasted h2/h3 are collapsed into Header, same as h1.)
+ *
+ * Map the shallowest heading level in the doc to Header, and deeper
+ * levels to Subheader — so both `#`/`##` and `##`/`###` documents work.
+ */
+const remapHeadingsForMediumPaste = (root: ParentNode): void => {
+    const headings = Array.from(
+        root.querySelectorAll('h1, h2, h3, h4, h5, h6')
+    ) as HTMLHeadingElement[];
+
+    if (headings.length === 0) return;
+
+    const levels = headings.map((el) => Number(el.tagName.charAt(1)));
+    const topLevel = Math.min(...levels);
+
+    headings.forEach((el) => {
+        const level = Number(el.tagName.charAt(1));
+        const tag = level === topLevel ? 'h1' : 'h4';
+        if (el.tagName.toLowerCase() === tag) return;
+
+        const replacement = document.createElement(tag);
+        replacement.innerHTML = el.innerHTML;
+        el.replaceWith(replacement);
+    });
+};
+
+const parseStoredTableMode = (value: string | null): TableMode => {
+    if (value === 'image' || value === 'gist' || value === 'plain') return value;
+    if (value === 'html') return 'plain';
+    return 'plain';
+};
 
 const MarkdownToMediumConverter: React.FC = () => {
     const [markdown, setMarkdown] = useState<string>('');
     const [htmlOutput, setHtmlOutput] = useState<string>('');
-    const [activeTab, setActiveTab] = useState<string>('editor');
-    const [darkMode] = useState<boolean>(false);
+    const [mobileTab, setMobileTab] = useState<string>('editor');
     const [wordCount, setWordCount] = useState<number>(0);
-    const [charCount, setCharCount] = useState<number>(0);
     const [addMediumClasses, setAddMediumClasses] = useState<boolean>(true);
+    const [showAdvanced, setShowAdvanced] = useState<boolean>(false);
     const [showOnboarding, setShowOnboarding] = useState<boolean>(false);
     const [showQuickGuide, setShowQuickGuide] = useState<boolean>(false);
-    const [showTableOptions, setShowTableOptions] = useState<boolean>(false);
-    const [tableHandlingMethod, setTableHandlingMethod] = useState<TableHandlingMethod>('image');
-    const [copied, setCopied] = useState<boolean>(false);
-    const [tableData, setTableData] = useState<TableData[]>([]);
     const [showGistInstructions, setShowGistInstructions] = useState<boolean>(false);
+    const [copied, setCopied] = useState<boolean>(false);
+    const [isCopying, setIsCopying] = useState<boolean>(false);
+    const [isConverting, setIsConverting] = useState<boolean>(false);
+    const [tableMode, setTableMode] = useState<TableMode>('plain');
+    const [tableData, setTableData] = useState<TableData[]>([]);
+    const [isPending, startTransition] = useTransition();
+    const previewRef = useRef<HTMLDivElement>(null);
     const { toast } = useToast();
 
-    const sampleMarkdown = `# Welcome to Markdown2Medium Converter!
+    const hasTables = useMemo(
+        () => extractTablesFromMarkdown(stripFrontmatter(markdown)).length > 0,
+        [markdown]
+    );
 
-## Getting Started
-
-Here's a sample post to show you how it works:
-
-### Features Highlight
-
-- ✨ Clean editor with live preview
-- 🎨 Medium-specific formatting
-- 💾 Export to HTML file
-- 📊 Table support (partial)
-
-## Try These Elements
-
-**Bold text** and *italic text*
-
-> A meaningful blockquote
-
-\`\`\`javascript
-// Code block example
-function hello() {
-  return "Medium readers!";
-}
-\`\`\`
-
-### Sample Table
-
-| Feature | Description | Status |
-| ------- | ----------- | ------ |
-| Headings | H1, H2, H3 formatting | ✅ |
-| Lists | Ordered and unordered lists | ✅ |
-| Code | Syntax highlighting | ✅ |
-| Tables | Properly formatted tables | ✅ |
-
-![Sample Image](https://placehold.co/800x400)
-
-## Happy Writing!
-
-Start editing this text or paste your own Markdown content.
-`;
+    const tableTip = useMemo(() => {
+        if (!hasTables) return null;
+        if (tableMode === 'image') {
+            return 'Preview shows tables as images. Copy for Medium still pastes them as readable text — Medium rejects embedded images.';
+        }
+        if (tableMode === 'gist') {
+            return 'Preview shows Gist placeholders. Copy pastes tables as readable text; use the Gist helper to embed them on Medium.';
+        }
+        return "Medium doesn't support tables — they'll paste as readable text (not a grid).";
+    }, [hasTables, tableMode]);
 
     const openNewPagePreview = (): void => {
-        // Get clean HTML without wrapper divs
         const cleanHtml = htmlOutput.replace(/^<div>|<\/div>$/g, '');
-
-        // Create complete HTML document with proper Medium styling
         const htmlContent = `
       <!DOCTYPE html>
-      <html class="${darkMode ? 'dark' : ''}">
+      <html>
         <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <title>Medium Post Preview</title>
           <style>
-            /* Medium-like styling */
+            body { font-family: Georgia, "Times New Roman", serif; margin: 0; background: #fff; color: #242424; }
+            main { max-width: 680px; margin: 0 auto; padding: 2rem 1.25rem; }
             .graf--h1 { font-size: 2.5rem; line-height: 1.2; margin: 2rem 0; font-weight: 700; }
             .graf--h2 { font-size: 2rem; margin: 1.8rem 0; font-weight: 600; }
-            .graf--p { font-size: 1.1rem; line-height: 1.7; margin: 1.5rem 0; color: #292929; }
-            .graf--blockquote { border-left: 4px solid #e6e6e6; padding-left: 1.5rem; margin: 2rem 0; color: #666; }
-            .graf--pre { background: #f8f8f8; padding: 1.5rem; border-radius: 4px; overflow: auto; }
-            .graf--image { max-width: 100%; height: auto; margin: 2rem 0; border-radius: 4px; }
-            .postList { list-style-type: disc; padding-left: 2rem; }
-            body.dark { background: #1a1a1a; color: #e6e6e6; }
-            body.dark .graf--p { color: #e6e6e6; }
-            
-            /* Table styling */
+            .graf--h3 { font-size: 1.5rem; margin: 1.4rem 0; font-weight: 600; }
+            .graf--p { font-size: 1.25rem; line-height: 1.7; margin: 1.5rem 0; }
+            .graf--blockquote { border-left: 3px solid #242424; padding-left: 1.25rem; margin: 2rem 0; color: #6b6b6b; font-style: italic; }
+            .graf--pre { background: #f2f2f2; padding: 1.25rem; border-radius: 4px; overflow: auto; font-family: ui-monospace, monospace; font-size: 0.9rem; }
+            .graf--li { margin: 0.35rem 0; }
+            .postList { padding-left: 1.5rem; }
+            .graf--image { max-width: 100%; height: auto; margin: 2rem 0; }
             table { border-collapse: collapse; width: 100%; margin: 2rem 0; }
             th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
             th { background-color: #f2f2f2; }
-            tr:nth-child(even) { background-color: #f9f9f9; }
-            
-            /* Gist embed styling */
-            .gist-embed { margin: 2rem 0; padding: 1rem; background: #f8f8f8; border-radius: 4px; }
-            .gist-embed-placeholder { border: 1px dashed #ccc; padding: 1rem; margin: 2rem 0; text-align: center; }
           </style>
         </head>
-        <body class="${darkMode ? 'dark bg-gray-900' : 'bg-white'}">
-          <main class="max-w-2xl mx-auto p-6">
-            ${cleanHtml}
-          </main>
+        <body>
+          <main>${cleanHtml}</main>
         </body>
       </html>
     `;
 
-        // Create blob and open in new window
         const blob = new Blob([htmlContent], { type: 'text/html' });
         const url = URL.createObjectURL(blob);
         const newWindow = window.open(url, '_blank');
-
-        // Clean up URL object after window opens
         if (newWindow) {
             newWindow.onload = () => URL.revokeObjectURL(url);
         }
     };
 
-    // Functions to handle tables
-    const extractTablesFromMarkdown = (markdownText: string): string[][] => {
-        const lines = markdownText.split('\n');
-        const tables: string[][] = [];
-        let currentTable: string[] = [];
-        let inTable = false;
-
-        for (let i = 0; i < lines.length; i++) {
-            const line = lines[i].trim();
-
-            if (line.includes('|')) {
-                if (!inTable) {
-                    inTable = true;
-                }
-                currentTable.push(line);
-            } else if (inTable) {
-                tables.push([...currentTable]);
-                currentTable = [];
-                inTable = false;
-            }
-        }
-
-        // Don't forget the last table if the text ends with a table
-        if (inTable && currentTable.length > 0) {
-            tables.push([...currentTable]);
-        }
-
-        return tables;
-    };
-
-    const processTablesForGist = (tables: string[][]): TableData[] => {
-        if (!tables || tables.length === 0) return [];
-
-        return tables.map((tableRows, index) => {
-            return {
-                id: `table-${index + 1}`,
-                content: tableRows.join('\n'),
-                filename: `table-${index + 1}.md`
-            };
-        });
-    };
-
-    const createTableHtml = (tableRows: string[]): string => {
-        // Skip if empty or not enough rows
-        if (!tableRows || tableRows.length < 2) return '';
-
-        // Process header
-        const headerRow = tableRows[0]
-            .trim()
-            .replace(/^\||\|$/g, '')
-            .split('|')
-            .map(cell => cell.trim());
-
-        // Check if second row is separator
-        const isSeparator = /^\|?\s*[-:]+\s*\|/.test(tableRows[1]);
-        const startContentRowIndex = isSeparator ? 2 : 1;
-
-        // Build HTML table
-        let html = '<table><thead><tr>';
-        headerRow.forEach(cell => {
-            html += `<th>${cell}</th>`;
-        });
-        html += '</tr></thead><tbody>';
-
-        // Add data rows
-        for (let i = startContentRowIndex; i < tableRows.length; i++) {
-            const cells = tableRows[i]
-                .trim()
-                .replace(/^\||\|$/g, '')
-                .split('|')
-                .map(cell => cell.trim());
-
-            html += '<tr>';
-            cells.forEach(cell => {
-                html += `<td>${cell}</td>`;
-            });
-            html += '</tr>';
-        }
-
-        html += '</tbody></table>';
-        return html;
-    };
-
-    const generateGistPlaceholder = (tableIndex: number): string => {
-        return `
-<div class="gist-embed-placeholder">
-  <p><strong>Table ${tableIndex}</strong> - Create a GitHub Gist with this content</p>
-  <p class="text-sm text-muted-foreground">Replace this placeholder with a GitHub Gist embed</p>
-</div>`;
-    };
-
-    const downloadTableAsMarkdown = (tableContent: string, filename: string): void => {
-        const blob = new Blob([tableContent], { type: 'text/markdown' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-    };
-
-    const convertTableToImage = async (tableHtml: string, tableIndex: string): Promise<TableImage | null> => {
+    const convertMarkdown = useCallback(async (content: string): Promise<{ html: string; tables: TableData[] }> => {
         try {
-            // Create a temporary container
-            const container = document.createElement('div');
-            container.style.position = 'absolute';
-            container.style.left = '-9999px';
-            container.style.padding = '20px';
-            container.style.background = 'white';
-            container.style.width = '800px';
-            container.style.fontFamily = 'Arial, sans-serif';
-            container.innerHTML = `
-                <style>
-                    table { border-collapse: collapse; width: 100%; }
-                    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-                    th { background-color: #f2f2f2; font-weight: bold; }
-                    tr:nth-child(even) { background-color: #f9f9f9; }
-                </style>
-                ${tableHtml}
-            `;
+            if (!content) return { html: '', tables: [] };
 
-            document.body.appendChild(container);
+            const processed = stripFrontmatter(content);
+            let html = await marked.parse(processed);
+            const extracted = extractTablesFromMarkdown(processed);
+            const tables = extracted.length > 0 ? processTablesForGist(extracted) : [];
 
-            // Use html2canvas to convert to image
-            const canvas = await html2canvas(container);
-            const svg = elementToSVG(container);
-            // Serialize the SVG to a string
-            const svgString = new XMLSerializer().serializeToString(svg);
-            document.body.removeChild(container);
-
-            // Convert canvas to data URL
-            return {
-                dataUrl: canvas.toDataURL('image/png'),
-                svg: svgString,
-                tableIndex
-            };
-
-        } catch (error) {
-            console.error('Error converting table to image:', error);
-            return null;
-        }
-    };
-
-    // Convert markdown to HTML with Medium classes
-    const convertMarkdown = useCallback(async (content: string): Promise<string> => {
-        try {
-            if (!content) return '';
-
-            const rawHtml = await marked.parse(content);
-            let mediumHtml = rawHtml;
-
-            // Process tables based on the selected method
-            if (tableHandlingMethod !== 'html') {
-                const tables = extractTablesFromMarkdown(content);
-
-                if (tables.length > 0) {
-                    setTableData(processTablesForGist(tables));
-
-                    // Replace all tables at once
+            if (extracted.length > 0) {
+                if (tableMode === 'plain') {
+                    html = replaceTablesWithPlain(html, extracted);
+                } else if (tableMode === 'gist') {
                     let tableIndex = 0;
-                    mediumHtml = mediumHtml.replace(/<table[^>]*>[\s\S]*?<\/table>/gi, (match) => {
-                        const currentIndex = tableIndex++;
+                    html = html.replace(/<table[^>]*>[\s\S]*?<\/table>/gi, () =>
+                        generateGistPlaceholder(++tableIndex)
+                    );
+                } else if (tableMode === 'image') {
+                    const images = await Promise.all(
+                        tables.map((table) =>
+                            convertTableToImage(createTableHtml(table.content.split('\n')), table.id)
+                        )
+                    );
 
-                        if (tableHandlingMethod === 'gist') {
-                            // Replace with Gist placeholder
-                            return generateGistPlaceholder(currentIndex + 1);
-                        } else if (tableHandlingMethod === 'image') {
-                            // Replace with image placeholder
-                            return `<div data-table-index="table-${currentIndex + 1}" class="table-image-placeholder">
-                                <p>Table ${currentIndex + 1} will be converted to an image</p>
-                            </div>`;
-                        }
-
-                        // This shouldn't happen, but return the original if it does
-                        return match;
+                    let imageIndex = 0;
+                    html = html.replace(/<table[^>]*>[\s\S]*?<\/table>/gi, () => {
+                        const image = images[imageIndex++];
+                        if (!image) return '';
+                        return `<div class="table-image-container">
+                            <img src="${image.dataUrl}" alt="Table ${image.tableIndex}" class="graf graf--image" />
+                        </div>`;
                     });
                 }
             }
 
             if (addMediumClasses) {
-                mediumHtml = mediumHtml
-                    .replace(/<h1/g, '<h1 class="graf graf--h1"')
-                    .replace(/<h2/g, '<h2 class="graf graf--h2"')
-                    .replace(/<h3/g, '<h3 class="graf graf--h3"')
-                    .replace(/<p>/g, '<p class="graf graf--p">')
-                    .replace(/<blockquote>/g, '<blockquote class="graf graf--blockquote graf--pullquote">')
-                    .replace(/<pre>/g, '<pre class="graf graf--pre">')
-                    .replace(/<code/g, '<code class="markup--code markup--pre-code"')
-                    .replace(/<ul>/g, '<ul class="postList graf graf--ul">')
-                    .replace(/<li>/g, '<li class="graf graf--li">')
-                    .replace(/<strong>/g, '<strong class="markup--strong markup--p-strong">')
-                    .replace(/<em>/g, '<em class="markup--em markup--p-em">')
-                    .replace(/<img/g, '<img class="graf graf--image"');
+                html = applyMediumClasses(html);
             }
 
-            // Handle image conversion for tables if needed
-            if (tableHandlingMethod === 'image') {
-                // We'll handle this in the useEffect after HTML is set
-                // For now, just return the HTML with placeholders
-            }
-
-            return DOMPurify.sanitize(mediumHtml);
+            html = preserveCodeBlockBlankLines(html);
+            html = normalizeDocumentImages(html);
+            return { html: DOMPurify.sanitize(html), tables };
         } catch (error) {
             console.error('Error parsing markdown:', error);
-            return '<div class="text-red-500">Error parsing markdown</div>';
+            return { html: '<div class="text-red-500">Error parsing markdown</div>', tables: [] };
         }
-    }, [addMediumClasses, tableHandlingMethod]);
-
+    }, [addMediumClasses, tableMode]);
 
     useEffect(() => {
-        // Only runs once
         const firstVisit = localStorage.getItem('firstVisit') == null;
         if (firstVisit) {
             localStorage.setItem('firstVisit', 'false');
             setShowOnboarding(true);
-            setMarkdown(sampleMarkdown);
+            setMarkdown(SAMPLE_MARKDOWN);
         }
 
-        const method = localStorage.getItem("tablehandlingMethod");
-        const isValidMethod = (val: string): val is TableHandlingMethod =>
-            val === 'html' || val === 'gist' || val === 'image';
-
-        if (method && isValidMethod(method)) {
-            setTableHandlingMethod(method);
-        }
-    }, [sampleMarkdown]);
+        setTableMode(parseStoredTableMode(localStorage.getItem('tablehandlingMethod')));
+    }, []);
 
     useEffect(() => {
-        if (tableHandlingMethod) {
-            localStorage.setItem('tablehandlingMethod', tableHandlingMethod);
-        }
-    }, [tableHandlingMethod]);
+        localStorage.setItem('tablehandlingMethod', tableMode);
+    }, [tableMode]);
 
     useEffect(() => {
-        const convertAndSetHtml = async () => {
-            const converted = await convertMarkdown(markdown);
-            setHtmlOutput(converted);
-        };
-        convertAndSetHtml();
-
         const words = markdown.trim() ? markdown.split(/\s+/).length : 0;
         setWordCount(words);
-        setCharCount(markdown.length);
+
+        let cancelled = false;
+        const timer = window.setTimeout(async () => {
+            setIsConverting(true);
+            try {
+                const { html, tables } = await convertMarkdown(markdown);
+                if (cancelled) return;
+                startTransition(() => {
+                    setTableData(tables);
+                    setHtmlOutput(html);
+                });
+            } finally {
+                if (!cancelled) setIsConverting(false);
+            }
+        }, 180);
+
+        return () => {
+            cancelled = true;
+            window.clearTimeout(timer);
+        };
     }, [markdown, convertMarkdown]);
 
-
-    // Handle image conversion for tables after HTML is set
+    // Replace broken preview images with a readable placeholder
     useEffect(() => {
-        const processTableImages = async () => {
-            if (tableHandlingMethod === 'image' && htmlOutput) {
-                // Create a temporary DOM element to find table placeholders
-                const tempDiv = document.createElement('div');
-                tempDiv.innerHTML = htmlOutput;
+        const root = previewRef.current;
+        if (!root) return;
 
-                const placeholders = tempDiv.querySelectorAll('.table-image-placeholder');
-                if (placeholders.length === 0) return;
-
-                // Process each table placeholder
-                const imagePromises: Promise<TableImage | null>[] = [];
-
-                tableData.forEach(table => {
-                    const tableHtml = createTableHtml(table.content.split('\n'));
-                    imagePromises.push(convertTableToImage(tableHtml, table.id));
-                });
-
-                // Wait for all image conversions and update HTML
-                const images = await Promise.all(imagePromises);
-                let updatedHtml = htmlOutput;
-
-                images.forEach(image => {
-                    if (!image) return;
-
-
-                    const placeholder = `<div class="table-image-placeholder" data-table-index="${image.tableIndex}">`;
-                    const imageHtml = `<div class="table-image-container">
-                        <img src="${image.dataUrl}" alt="Table ${image.tableIndex}" class="graf graf--image" />
-                    </div>`;
-
-                    // const svgBase64 = btoa(unescape(encodeURIComponent(image.svg)));
-                    // const dataUrl = `data:image/svg+xml;base64,${svgBase64}`;
-
-                    // const placeholder = `<div class="table-image-placeholder" data-table-index="${image.tableIndex}">`;
-                    // const imageHtml = `<div class="table-image-container">
-                    //     <img src="${dataUrl}" alt="Table ${image.tableIndex}" class="graf graf--image" />
-                    // </div>`;
-
-                    updatedHtml = updatedHtml.replace(
-                        new RegExp(placeholder + '.*?</div>', 's'),
-                        imageHtml
-                    );
-                });
-
-                setHtmlOutput(updatedHtml);
-            }
+        const handleError = (event: Event) => {
+            const img = event.target as HTMLImageElement;
+            if (!img || img.tagName !== 'IMG' || img.dataset.failed === '1') return;
+            img.dataset.failed = '1';
+            const alt = img.getAttribute('alt')?.trim() || 'Image unavailable';
+            const placeholder = document.createElement('p');
+            placeholder.className = 'image-missing';
+            placeholder.innerHTML = `<em>[${escapeHtml(alt)}]</em>`;
+            img.replaceWith(placeholder);
         };
 
-        processTableImages();
-    }, [htmlOutput, tableHandlingMethod, tableData]);
+        const images = Array.from(root.querySelectorAll('img'));
+        images.forEach((img) => {
+            img.addEventListener('error', handleError);
+            if (img.complete && img.naturalWidth === 0 && img.getAttribute('src')) {
+                handleError({ target: img } as unknown as Event);
+            }
+        });
+
+        return () => {
+            images.forEach((img) => img.removeEventListener('error', handleError));
+        };
+    }, [htmlOutput]);
 
     const downloadHtml = useCallback((): void => {
         const blob = new Blob([htmlOutput], { type: 'text/html' });
@@ -474,586 +632,611 @@ Start editing this text or paste your own Markdown content.
     }, [htmlOutput]);
 
     const loadSample = useCallback((): void => {
-        setMarkdown(sampleMarkdown);
-    }, [sampleMarkdown]);
+        setMarkdown(SAMPLE_MARKDOWN);
+    }, []);
 
     const clearEditor = useCallback((): void => {
         setMarkdown('');
     }, []);
 
-    const copyHtmlToClipboard = useCallback((): void => {
-        navigator.clipboard.writeText(htmlOutput);
-        setCopied(true);
-        toast({
-            title: "HTML copied to clipboard",
-            description: "You can now paste it into Medium's editor",
-            duration: 3000,
-        });
-        setTimeout(() => setCopied(false), 2000);
-    }, [htmlOutput, toast]);
+    // Copy uses stacked plain paragraphs for tables — Medium rejects HTML tables and data: images
+    const prepareHtmlForMediumPaste = useCallback(async (content: string): Promise<string> => {
+        if (!content) return '';
 
-    const downloadAllTablesAsGist = useCallback((): void => {
-        if (!tableData.length) {
-            toast({
-                title: "No tables found",
-                description: "No table content to download",
-                variant: "destructive",
-                duration: 3000,
-            });
-            return;
+        const processed = stripFrontmatter(content);
+        let html = await marked.parse(processed);
+        const tables = extractTablesFromMarkdown(processed);
+        html = replaceTablesWithPlain(html, tables);
+        html = preserveCodeBlockBlankLines(html);
+        html = normalizeDocumentImages(html);
+        html = DOMPurify.sanitize(html, {
+            ALLOWED_TAGS: [
+                'h1', 'h2', 'h3', 'h4', 'p', 'br', 'hr',
+                'strong', 'b', 'em', 'i', 'u', 'a',
+                'ul', 'ol', 'li',
+                'blockquote', 'pre', 'code',
+                'img', 'figure', 'figcaption',
+                'span',
+            ],
+            ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class'],
+            ALLOW_DATA_ATTR: false,
+        });
+
+        const container = document.createElement('div');
+        container.innerHTML = html;
+
+        remapHeadingsForMediumPaste(container);
+
+        container.querySelectorAll('img').forEach((img) => {
+            const src = (img.getAttribute('src') || '').trim();
+            const alt = (img.getAttribute('alt') || 'Image unavailable').trim();
+            if (!isUsableImageSrc(src)) {
+                const placeholder = document.createElement('p');
+                placeholder.innerHTML = `<em>[${escapeHtml(alt)}]</em>`;
+                img.replaceWith(placeholder);
+            }
+        });
+
+        container.querySelectorAll('p, blockquote, li').forEach((el) => {
+            if (!el.textContent?.trim() && !el.querySelector('img')) {
+                el.remove();
+            }
+        });
+
+        container.querySelectorAll('blockquote').forEach((quote) => {
+            const onlyChild = quote.children.length === 1 ? quote.children[0] : null;
+            if (onlyChild && onlyChild.tagName === 'P') {
+                quote.innerHTML = onlyChild.innerHTML;
+            }
+        });
+
+        return container.innerHTML;
+    }, []);
+
+    const copyRichContentFallback = (html: string): boolean => {
+        const container = document.createElement('div');
+        container.innerHTML = html;
+        container.setAttribute('contenteditable', 'true');
+        container.style.position = 'fixed';
+        container.style.left = '-9999px';
+        container.style.top = '0';
+        document.body.appendChild(container);
+
+        const selection = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(container);
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+
+        let success = false;
+        try {
+            success = document.execCommand('copy');
+        } catch {
+            success = false;
         }
 
-        tableData.forEach(table => {
-            downloadTableAsMarkdown(table.content, table.filename);
-        });
+        selection?.removeAllRanges();
+        document.body.removeChild(container);
+        return success;
+    };
 
-        setShowGistInstructions(true);
-    }, [tableData, toast]);
+    const copyHtmlToClipboard = useCallback(async (): Promise<void> => {
+        if (!markdown.trim() || isCopying) return;
+
+        setIsCopying(true);
+        try {
+            const pasteHtml = await prepareHtmlForMediumPaste(markdown);
+            if (!pasteHtml) return;
+
+            const temp = document.createElement('div');
+            temp.innerHTML = pasteHtml;
+            const plainText = temp.textContent || temp.innerText || '';
+
+            let success = false;
+
+            try {
+                await navigator.clipboard.write([
+                    new ClipboardItem({
+                        'text/html': new Blob([pasteHtml], { type: 'text/html' }),
+                        'text/plain': new Blob([plainText], { type: 'text/plain' }),
+                    }),
+                ]);
+                success = true;
+            } catch {
+                success = copyRichContentFallback(pasteHtml);
+            }
+
+            if (success) {
+                setCopied(true);
+                let description = "Paste into Medium with Cmd/Ctrl+V.";
+                if (hasTables) {
+                    if (tableMode === 'image') {
+                        description = "Tables pasted as readable text (Medium rejects embedded images). Use Download HTML if you need the image versions.";
+                    } else if (tableMode === 'gist') {
+                        description = "Tables pasted as readable text. Use the Gist helper if you want to embed them.";
+                    } else {
+                        description = "Paste into Medium (Cmd/Ctrl+V). Tables paste as readable text.";
+                    }
+                }
+                toast({
+                    title: "Copied for Medium",
+                    description,
+                    duration: 4500,
+                });
+                setTimeout(() => setCopied(false), 2000);
+            } else {
+                toast({
+                    title: "Copy failed",
+                    description: "Could not copy. Try Full Preview and copy from there.",
+                    variant: "destructive",
+                    duration: 4000,
+                });
+            }
+        } finally {
+            setIsCopying(false);
+        }
+    }, [markdown, prepareHtmlForMediumPaste, toast, hasTables, tableMode, isCopying]);
+
+    const downloadTableAsMarkdown = (tableContent: string, filename: string): void => {
+        const blob = new Blob([tableContent], { type: 'text/markdown' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    };
 
     const createGistForTable = useCallback((tableIndex: number): void => {
         if (!tableData[tableIndex]) return;
-
         const table = tableData[tableIndex];
 
-        // Copy table content to clipboard
         navigator.clipboard.writeText(table.content).then(() => {
             toast({
-                title: "Table content copied!",
-                description: `Table ${tableIndex + 1} content is ready to paste into GitHub Gist`,
+                title: "Table content copied",
+                description: `Table ${tableIndex + 1} is ready to paste into a new GitHub Gist`,
                 duration: 4000,
             });
         });
 
-        // Open GitHub Gist in new tab with pre-filled filename
-        const gistUrl = new URL('https://gist.github.com/');
-        const newWindow = window.open(gistUrl.toString(), '_blank');
-
-        if (newWindow) {
-            // Add instructions for the user
-            setTimeout(() => {
-                toast({
-                    title: "Instructions",
-                    description: "Paste the copied content in the new GitHub Gist tab, then copy the embed code back here",
-                    duration: 6000,
-                });
-            }, 1000);
-        }
+        window.open('https://gist.github.com/', '_blank');
     }, [tableData, toast]);
 
-    const openAllGistCreations = useCallback((): void => {
+    const openGistHelper = useCallback((): void => {
         if (!tableData.length) {
             toast({
                 title: "No tables found",
-                description: "No table content available",
+                description: "Add a Markdown table first",
                 variant: "destructive",
                 duration: 3000,
             });
             return;
         }
-
-        // Copy all table data to clipboard as JSON for easy reference
-        const allTablesData = tableData.map((table, index) => ({
-            tableNumber: index + 1,
-            filename: table.filename,
-            content: table.content
-        }));
-
-        navigator.clipboard.writeText(JSON.stringify(allTablesData, null, 2));
-
-        // Open GitHub Gist
-        window.open('https://gist.github.com/', '_blank');
-
         setShowGistInstructions(true);
-
-        toast({
-            title: "All table data copied!",
-            description: "Table data is in your clipboard. Create gists and follow the instructions in the dialog.",
-            duration: 5000,
-        });
     }, [tableData, toast]);
 
+    const editorPane = (
+        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden shadow-sm">
+            <CardHeader className="flex shrink-0 flex-row items-center justify-between space-y-0 border-b px-4 py-3">
+                <CardTitle className="flex items-center gap-2 text-sm font-medium">
+                    <Code2 className="h-4 w-4 text-muted-foreground" />
+                    Markdown
+                </CardTitle>
+                <div className="flex items-center gap-1">
+                    <Button type="button" variant="ghost" size="sm" onClick={loadSample}>
+                        Sample
+                    </Button>
+                    <Button type="button" variant="ghost" size="sm" onClick={clearEditor}>
+                        <X />
+                        Clear
+                    </Button>
+                </div>
+            </CardHeader>
+            <CardContent className="min-h-0 flex-1 p-0">
+                <Textarea
+                    placeholder="Paste or write your Markdown here…"
+                    className="h-full min-h-0 resize-none rounded-none border-0 bg-transparent font-mono text-sm shadow-none focus-visible:ring-0"
+                    value={markdown}
+                    onChange={(e) => setMarkdown(e.target.value)}
+                />
+            </CardContent>
+            {tableTip ? (
+                <CardFooter className="shrink-0 animate-in fade-in slide-in-from-bottom-1 border-t px-4 py-3 duration-200">
+                    <Alert className="w-full py-2">
+                        <Info className="h-4 w-4" />
+                        <AlertDescription className="text-muted-foreground">
+                            {tableTip}{' '}
+                            <button
+                                type="button"
+                                onClick={() => setShowAdvanced(true)}
+                                className="font-medium text-foreground underline-offset-4 transition-colors hover:underline"
+                            >
+                                Change in Advanced
+                            </button>
+                        </AlertDescription>
+                    </Alert>
+                </CardFooter>
+            ) : null}
+        </Card>
+    );
+
+    const previewUpdating = isConverting || isPending;
+
+    const previewPane = (
+        <Card className="flex min-h-0 flex-1 flex-col overflow-hidden shadow-sm transition-shadow duration-200">
+            <CardHeader className="flex shrink-0 flex-row items-center justify-between space-y-0 border-b px-4 py-3">
+                <CardTitle className="flex items-center gap-2 text-sm font-medium">
+                    <Eye className="h-4 w-4 text-muted-foreground" />
+                    Preview
+                </CardTitle>
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    {previewUpdating && (
+                        <span className="inline-flex items-center gap-1.5 animate-in fade-in duration-200">
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            Updating
+                        </span>
+                    )}
+                    <span className="tabular-nums">
+                        {wordCount} {wordCount === 1 ? 'word' : 'words'}
+                    </span>
+                </div>
+            </CardHeader>
+            <CardContent className="relative min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6">
+                <div
+                    ref={previewRef}
+                    className={`transition-opacity duration-300 ease-out ${
+                        previewUpdating ? 'opacity-50' : 'opacity-100'
+                    }`}
+                >
+                    {htmlOutput ? (
+                        <div
+                            className="prose prose-neutral max-w-none text-[1.05rem] leading-relaxed [&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2"
+                            dangerouslySetInnerHTML={{ __html: htmlOutput }}
+                        />
+                    ) : (
+                        <p className="text-sm text-muted-foreground">Preview appears here as you type.</p>
+                    )}
+                </div>
+            </CardContent>
+        </Card>
+    );
+
     return (
-        <div className={`min-h-screen ${darkMode ? 'dark bg-gray-900' : 'bg-gray-50'}`}>
-            {/* Onboarding Dialog */}
+        <div className="flex h-dvh flex-col overflow-hidden bg-muted/40 text-foreground">
             <Dialog open={showOnboarding} onOpenChange={setShowOnboarding}>
-                <DialogContent className="sm:max-w-2xl p-10">
+                <DialogContent className="sm:max-w-md">
                     <DialogHeader>
-                        <div className="flex items-center gap-3">
-                            <Rocket className="h-8 w-8 text-blue-600" />
-                            <DialogTitle className="text-2xl">Welcome to Markdown2Medium Converter!</DialogTitle>
-                        </div>
-                        <DialogDescription className="text-left pt-4">
-                            Let&apos;s get you started with this simple 3-step guide:
+                        <DialogTitle>Markdown → Medium</DialogTitle>
+                        <DialogDescription className="pt-2 text-left">
+                            Write in Markdown, copy, then paste into Medium. That&apos;s it.
                         </DialogDescription>
                     </DialogHeader>
-                    <div className="grid gap-4 py-4">
-                        <div className="flex items-start gap-4">
-                            <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">1</span>
-                            <div>
-                                <h3 className="font-semibold">Write or paste your Markdown</h3>
-                                <p className="text-sm text-muted-foreground my-2">
-                                    Use the editor to write your content with Markdown syntax. We&apos;ve preloaded a sample for you.
-                                </p>
-                            </div>
-                        </div>
-                        <div className="flex items-start gap-4">
-                            <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">2</span>
-                            <div>
-                                <h3 className="font-semibold">Preview your Medium post</h3>
-                                <p className="text-sm text-muted-foreground my-2">
-                                    Switch to the preview tab to see how it will look on Medium.
-                                </p>
-                            </div>
-                        </div>
-                        <div className="flex items-start gap-4">
-                            <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">3</span>
-                            <div>
-                                <h3 className="font-semibold">Copy or export HTML</h3>
-                                <p className="text-sm text-muted-foreground my-2">
-                                    Get the formatted HTML or copy the content to paste directly into Medium&apos;s editor.
-                                </p>
-                            </div>
-                        </div>
-                    </div>
+                    <ol className="list-decimal space-y-3 py-2 pl-5 text-sm text-muted-foreground">
+                        <li>Paste or write your Markdown on the left.</li>
+                        <li>Check the preview on the right.</li>
+                        <li>Click <span className="font-medium text-foreground">Copy for Medium</span>, then paste in Medium.</li>
+                    </ol>
                     <DialogFooter>
                         <Button onClick={() => setShowOnboarding(false)} className="w-full">
-                            Get Started
+                            Get started
                         </Button>
                     </DialogFooter>
                 </DialogContent>
             </Dialog>
 
-            {/* Quick Guide Dialog */}
             <Dialog open={showQuickGuide} onOpenChange={setShowQuickGuide}>
-                <DialogContent className="max-w-[95vw] sm:max-w-2xl overflow-y-auto max-h-[90vh]">
+                <DialogContent className="max-h-[90vh] max-w-[95vw] overflow-y-auto sm:max-w-2xl">
                     <DialogHeader>
-                        <DialogTitle>Markdown Quick Reference</DialogTitle>
+                        <DialogTitle>Markdown reference</DialogTitle>
                         <DialogDescription>
-                            Common formatting syntax you can use in the editor
+                            Common syntax you can use in the editor
                         </DialogDescription>
                     </DialogHeader>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6 py-4">
+                    <div className="grid grid-cols-1 gap-6 py-2 md:grid-cols-2">
                         <div>
-                            <h3 className="font-semibold mb-3">Text Formatting</h3>
-                            <div className="space-y-2 text-sm">
-                                <p><code># Heading 1</code></p>
-                                <p><code>## Heading 2</code></p>
-                                <p><code>**bold**</code> or <code>__bold__</code></p>
-                                <p><code>*italic*</code> or <code>_italic_</code></p>
+                            <h3 className="mb-2 text-sm font-medium">Text</h3>
+                            <div className="space-y-1.5 font-mono text-sm text-muted-foreground">
+                                <p># or ## → Header <span className="font-sans">(large T)</span></p>
+                                <p>Next level down → Subheader <span className="font-sans">(small T)</span></p>
+                                <p>**bold** or __bold__</p>
+                                <p>*italic* or _italic_</p>
                             </div>
                         </div>
-
                         <div>
-                            <h3 className="font-semibold mb-3">Lists & Blocks</h3>
-                            <div className="space-y-2 text-sm">
-                                <p><code>- Unordered item</code></p>
-                                <p><code>1. Ordered item</code></p>
-                                <p><code>&gt; Blockquote</code></p>
-                                <p><code>``` Code block ```</code></p>
+                            <h3 className="mb-2 text-sm font-medium">Lists & blocks</h3>
+                            <div className="space-y-1.5 font-mono text-sm text-muted-foreground">
+                                <p>- Unordered item</p>
+                                <p>1. Ordered item</p>
+                                <p>&gt; Blockquote</p>
+                                <p>{'``` code ```'}</p>
                             </div>
                         </div>
-
                         <div>
-                            <h3 className="font-semibold mb-3">Media & Links</h3>
-                            <div className="space-y-2 text-sm">
-                                <p><code>![alt](url)</code> (images)</p>
-                                <p><code>[text](url)</code> (links)</p>
+                            <h3 className="mb-2 text-sm font-medium">Media & links</h3>
+                            <div className="space-y-1.5 font-mono text-sm text-muted-foreground">
+                                <p>![alt](url)</p>
+                                <p>[text](url)</p>
                             </div>
                         </div>
-
-                        <div className="col-span-1 md:col-span-2">
-                            <h3 className="font-semibold mb-3">Table Example</h3>
-                            <div className="space-y-2 text-sm">
-                                <pre className="bg-gray-100 p-2 rounded dark:bg-gray-800 overflow-auto text-sm leading-5 whitespace-pre">
-                                    {`| Name  | Role     | Department |
-| ----- | -------- | ---------- |
-| John  | Manager  | Sales      |
-| Alice | Engineer | DevOps     |`}
-                                </pre>
-                                <p className="text-muted-foreground mt-2">
-                                    💡 Tip: Make sure there are at least 3 dashes in each column of the separator row.
-                                </p>
-                            </div>
-                        </div>
-
                         <div>
-                            <h3 className="font-semibold mb-3">Advanced</h3>
-                            <div className="space-y-2 text-sm">
-                                <p><code>---</code> (horizontal rule)</p>
-                                <p><code>`inline code`</code></p>
-                                <p><code>~~strikethrough~~</code></p>
+                            <h3 className="mb-2 text-sm font-medium">Other</h3>
+                            <div className="space-y-1.5 font-mono text-sm text-muted-foreground">
+                                <p>---</p>
+                                <p>`inline code`</p>
                             </div>
                         </div>
-                    </div>
-                </DialogContent>
-            </Dialog>
-
-            {/* Table Options Dialog */}
-            <Dialog open={showTableOptions} onOpenChange={setShowTableOptions}>
-                <DialogContent className="sm:max-w-lg">
-                    <DialogHeader>
-                        <DialogTitle className="flex items-center gap-2">
-                            <Table className="h-5 w-5" />
-                            Table Handling Options
-                        </DialogTitle>
-                        <DialogDescription>
-                            Choose how to handle tables for better Medium compatibility
-                        </DialogDescription>
-                    </DialogHeader>
-                    <div className="py-4">
-                        <RadioGroup value={tableHandlingMethod} onValueChange={(value: TableHandlingMethod) => setTableHandlingMethod(value)} className="space-y-4">
-                            <div className="flex items-start space-x-3 space-y-0">
-                                <RadioGroupItem value="html" id="html" />
-                                <div className="grid gap-1.5">
-                                    <Label htmlFor="html" className="font-medium">
-                                        HTML Tables
-                                    </Label>
-                                    <p className="text-sm text-muted-foreground">
-                                        Convert markdown tables to HTML tables with Medium-friendly styling
-                                    </p>
-                                </div>
-                            </div>
-                            <div className="flex items-start space-x-3 opacity-60">
-                                <RadioGroupItem value="gist" id="gist" />
-                                <div className="grid gap-1.5">
-                                    <Label htmlFor="gist" className="font-medium flex items-center gap-2">
-                                        GitHub Gist Embed <Github className="h-4 w-4" />
-                                        <span className="text-xs px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded-full">
-                                            Under Development
-                                        </span>
-                                    </Label>
-                                    <p className="text-sm text-muted-foreground">
-                                        Extract tables as GitHub Gists and embed them in your Medium post
-                                    </p>
-                                </div>
-                            </div>
-
-                            <div className="flex items-start space-x-3 space-y-0">
-                                <RadioGroupItem value="image" id="image" />
-                                <div className="grid gap-1.5">
-                                    <Label htmlFor="image" className="font-medium flex items-center gap-2">
-                                        Convert to Images <ImageIcon className="h-4 w-4" /> <span className="text-muted-foreground font-normal">(Default)</span>
-                                    </Label>
-                                    <p className="text-sm text-muted-foreground">
-                                        Convert tables to images that display perfectly on Medium
-                                    </p>
-                                </div>
-                            </div>
-                        </RadioGroup>
-
-                        {tableHandlingMethod === 'gist' && (
-                            <div className="mt-6 p-4 bg-amber-50 dark:bg-amber-900/20 rounded-md border border-amber-200 dark:border-amber-800">
-                                <div className="flex items-start gap-3">
-                                    <AlertCircle className="h-5 w-5 text-amber-600 dark:text-amber-400 mt-0.5" />
-                                    <div>
-                                        <h4 className="font-medium text-amber-800 dark:text-amber-300">GitHub Gist Instructions</h4>
-                                        <p className="text-sm text-amber-700 dark:text-amber-400 mt-1">
-                                            You&apos;ll need to create GitHub Gists for your tables and replace the placeholders in the HTML output.
-                                        </p>
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-                    </div>
-                    <DialogFooter>
-                        <Button onClick={() => setShowTableOptions(false)}>
-                            Apply Selection
-                        </Button>
-                    </DialogFooter>
-                </DialogContent>
-            </Dialog>
-
-            {/* GitHub Gist Instructions Dialog */}
-            <Dialog open={showGistInstructions} onOpenChange={setShowGistInstructions}>
-                <DialogContent className="sm:max-w-4xl max-h-[90vh] overflow-y-auto">
-                    <DialogHeader>
-                        <DialogTitle className="flex items-center gap-2">
-                            <Github className="h-5 w-5" />
-                            GitHub Gist Creation Assistant
-                        </DialogTitle>
-                        <DialogDescription>
-                            Create GitHub Gists for your tables with these improved tools
-                        </DialogDescription>
-                    </DialogHeader>
-                    <div className="space-y-6 py-4">
-                        {/* Quick Actions */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                            <Button
-                                onClick={openAllGistCreations}
-                                className="w-full flex items-center gap-2"
-                            >
-                                <Github className="h-4 w-4" />
-                                Open GitHub Gist & Copy All Tables
-                            </Button>
-                            <Button
-                                onClick={downloadAllTablesAsGist}
-                                variant="outline"
-                                className="w-full flex items-center gap-2"
-                            >
-                                <Download className="h-4 w-4" />
-                                Download Table Files (Backup)
-                            </Button>
-                        </div>
-
-                        {/* Individual Table Actions */}
-                        {tableData.length > 0 && (
-                            <div>
-                                <h3 className="font-semibold mb-3">Individual Table Actions</h3>
-                                <div className="grid gap-3">
-                                    {tableData.map((table, index) => (
-                                        <div key={table.id} className="flex items-center justify-between p-3 border rounded-md">
-                                            <div>
-                                                <h4 className="font-medium">Table {index + 1}</h4>
-                                                <p className="text-sm text-muted-foreground">{table.filename}</p>
-                                                <p className="text-xs text-muted-foreground mt-1">
-                                                    {table.content.split('\n').length} lines
-                                                </p>
-                                            </div>
-                                            <div className="flex gap-2">
-                                                <Button
-                                                    size="sm"
-                                                    variant="outline"
-                                                    onClick={() => {
-                                                        navigator.clipboard.writeText(table.content);
-                                                        toast({
-                                                            title: "Copied!",
-                                                            description: `Table ${index + 1} content copied to clipboard`,
-                                                            duration: 2000,
-                                                        });
-                                                    }}
-                                                >
-                                                    <Copy className="h-3 w-3 mr-1" />
-                                                    Copy
-                                                </Button>
-                                                <Button
-                                                    size="sm"
-                                                    onClick={() => createGistForTable(index)}
-                                                >
-                                                    Create Gist
-                                                </Button>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
-
-                        <div className="space-y-4">
-                            <div className="flex items-start gap-4">
-                                <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">1</span>
-                                <div>
-                                    <h3 className="font-semibold">Create GitHub Gists (Automated)</h3>
-                                    <p className="text-sm text-muted-foreground my-2">
-                                        Click &quot;Create Gist&quot; for each table above, or use &quot;Open GitHub Gist & Copy All Tables&quot; to handle all at once.
-                                        The table content will be automatically copied to your clipboard.
-                                    </p>
-                                </div>
-                            </div>
-                            <div className="flex items-start gap-4">
-                                <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">2</span>
-                                <div>
-                                    <h3 className="font-semibold">Paste and Create Gist</h3>
-                                    <p className="text-sm text-muted-foreground my-2">
-                                        In the opened GitHub Gist tab:
-                                        • Paste the copied content (Ctrl/Cmd + V)
-                                        • Set the filename (e.g., &quot;table-1.md&quot;)
-                                        • Make it public or secret as preferred
-                                        • Click &quot;Create public gist&quot; or &quot;Create secret gist&quot;
-                                    </p>
-                                </div>
-                            </div>
-                            <div className="flex items-start gap-4">
-                                <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">3</span>
-                                <div>
-                                    <h3 className="font-semibold">Get the embed code</h3>
-                                    <p className="text-sm text-muted-foreground my-2">
-                                        After creating each gist, click the &quot;Embed&quot; button and copy the <code>&lt;script&gt;</code> tag provided.
-                                    </p>
-                                </div>
-                            </div>
-                            <div className="flex items-start gap-4">
-                                <span className="bg-blue-100 text-blue-600 text-xs font-medium me-2 px-2.5 py-1 mt-1 dark:bg-blue-700 dark:text-blue-300 rounded-full">4</span>
-                                <div>
-                                    <h3 className="font-semibold">Replace the placeholders</h3>
-                                    <p className="text-sm text-muted-foreground my-2">
-                                        In your copied HTML, find the placeholder divs for tables and replace them with the gist embed codes.
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-
-                        <div className="bg-gray-50 dark:bg-gray-800 p-4 rounded-md">
-                            <h4 className="font-medium mb-2">Example of placeholder to replace:</h4>
-                            <pre className="text-xs p-2 bg-gray-100 dark:bg-gray-900 rounded overflow-x-auto">
-                                {'<div class="gist-embed-placeholder">\n  <p><strong>Table 1</strong> - Create a GitHub Gist with this content</p>\n  <p class="text-sm text-muted-foreground">\n    Replace this placeholder with a GitHub Gist embed\n  </p>\n</div>'}
+                        <div className="md:col-span-2">
+                            <h3 className="mb-2 text-sm font-medium">Tables</h3>
+                            <pre className="overflow-auto rounded-md bg-muted p-3 text-sm leading-5">
+{`| Name  | Role     |
+| ----- | -------- |
+| John  | Manager  |
+| Alice | Engineer |`}
                             </pre>
-                            <p className="text-sm text-muted-foreground mt-2">
-                                Replace this entire div with: <code>&lt;script src=&quot;https://gist.github.com/username/gist-id.js&quot;&gt;&lt;/script&gt;</code>
+                            <p className="mt-2 text-sm text-muted-foreground">
+                                By default tables paste as readable text (not a grid). Change how preview handles them under Advanced.
                             </p>
                         </div>
                     </div>
-                    <DialogFooter>
-                        <Button onClick={() => setShowGistInstructions(false)}>
-                            Got it
+                </DialogContent>
+            </Dialog>
+
+            <Dialog open={showGistInstructions} onOpenChange={setShowGistInstructions}>
+                <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
+                    <DialogHeader>
+                        <DialogTitle className="flex items-center gap-2">
+                            <Github className="h-5 w-5" />
+                            GitHub Gist helper
+                        </DialogTitle>
+                        <DialogDescription>
+                            Create a Gist for each table, then paste the embed into Medium.
+                        </DialogDescription>
+                    </DialogHeader>
+                    <div className="space-y-4 py-2">
+                        {tableData.map((table, index) => (
+                            <div
+                                key={table.id}
+                                className="flex items-center justify-between gap-3 rounded-lg border bg-card p-3"
+                            >
+                                <div>
+                                    <p className="text-sm font-medium">Table {index + 1}</p>
+                                    <p className="text-xs text-muted-foreground">{table.filename}</p>
+                                </div>
+                                <div className="flex gap-2">
+                                    <Button
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => {
+                                            navigator.clipboard.writeText(table.content);
+                                            toast({
+                                                title: "Copied",
+                                                description: `Table ${index + 1} copied`,
+                                                duration: 2000,
+                                            });
+                                        }}
+                                    >
+                                        <Copy />
+                                        Copy
+                                    </Button>
+                                    <Button size="sm" onClick={() => createGistForTable(index)}>
+                                        Create Gist
+                                    </Button>
+                                </div>
+                            </div>
+                        ))}
+                        <ol className="list-decimal space-y-2 pl-5 text-sm text-muted-foreground">
+                            <li>Click Create Gist — content is copied and gist.github.com opens.</li>
+                            <li>Paste, name the file, and create the gist.</li>
+                            <li>Copy the Embed script and replace the placeholder in your Medium draft.</li>
+                        </ol>
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            className="w-full"
+                            onClick={() => {
+                                tableData.forEach((table) =>
+                                    downloadTableAsMarkdown(table.content, table.filename)
+                                );
+                            }}
+                        >
+                            <Download />
+                            Download table files
                         </Button>
+                    </div>
+                    <DialogFooter>
+                        <Button size="sm" onClick={() => setShowGistInstructions(false)}>Done</Button>
                     </DialogFooter>
                 </DialogContent>
             </Dialog>
 
-            {/* Header */}
-            <header className="border-b bg-white dark:bg-gray-950 dark:border-gray-800">
-                <div className="container mx-auto px-4 py-4 flex flex-col sm:flex-row justify-between items-center gap-4">
+            <header className="sticky top-0 z-10 shrink-0 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80">
+                <div className="mx-auto flex h-14 max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
                     <div className="flex items-center gap-3">
-                        <Image src={"/markdown2medium.png"} alt="markdown2medium" width={50} height={50}></Image>
-                        <h1 className="text-xl font-bold">Markdown2Medium</h1>
+                        <Image src="/markdown2medium.png" alt="Markdown2Medium" width={32} height={32} />
+                        <div className="leading-tight">
+                            <h1 className="text-base font-semibold tracking-tight">Markdown2Medium</h1>
+                            <p className="hidden text-xs text-muted-foreground sm:block">
+                                Paste Markdown · Copy · Paste into Medium
+                            </p>
+                        </div>
                     </div>
-                    <div className="flex gap-3">
-                        <TooltipProvider>
-                            <Tooltip>
-                                <TooltipTrigger asChild>
-                                    <Button variant="outline" size="sm" onClick={() => setShowQuickGuide(true)}>
-                                        <HelpCircle className="h-4 w-4 mr-2" />
-                                        Guide
-                                    </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                    <p>Show quick reference guide</p>
-                                </TooltipContent>
-                            </Tooltip>
-                        </TooltipProvider>
-                        <TooltipProvider>
-                            <Tooltip>
-                                <TooltipTrigger asChild>
-                                    <Button variant="outline" size="sm" onClick={() => setShowTableOptions(true)}>
-                                        <Table className="h-4 w-4 mr-2" />
-                                        Tables
-                                    </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>
-                                    <p>Configure table handling options</p>
-                                </TooltipContent>
-                            </Tooltip>
-                        </TooltipProvider>
-                    </div>
+                    <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setShowQuickGuide(true)}
+                    >
+                        <HelpCircle />
+                        Help
+                    </Button>
                 </div>
             </header>
 
-            {/* Main Content */}
-            <main className="container mx-auto px-4 py-6">
-                <div className="grid grid-cols-1 lg:grid-cols-[1fr_auto] gap-6">
-                    <Card className="w-full">
-                        <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
-                            <CardHeader className="pb-2">
-                                <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-                                    <TabsList className="flex-wrap">
-                                        <TabsTrigger value="editor" className="flex items-center gap-2">
-                                            <Code2 className="h-4 w-4" />
-                                            Editor
-                                        </TabsTrigger>
-                                        <TabsTrigger value="preview" className="flex items-center gap-2">
-                                            <Eye className="h-4 w-4" />
-                                            Preview
-                                        </TabsTrigger>
-                                    </TabsList>
-
-                                    <div className="flex flex-col sm:flex-row sm:items-center gap-2 text-sm text-muted-foreground">
-                                        <span>{wordCount} words</span>
-                                        <Separator orientation="vertical" className="hidden sm:block h-4" />
-                                        <span>{charCount} characters</span>
-                                    </div>
-                                </div>
-                            </CardHeader>
-
-                            <CardContent>
-                                <TabsContent value="editor" className="mt-0">
-                                    <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 mb-4">
-                                        <div className="flex items-center gap-2">
-                                            <Switch
-                                                id="medium-classes"
-                                                checked={addMediumClasses}
-                                                onCheckedChange={setAddMediumClasses}
-                                            />
-                                            <Label htmlFor="medium-classes" className="text-sm cursor-pointer">Medium Classes</Label>
-                                        </div>
-
-                                        <div className="flex flex-wrap gap-2">
-                                            <Button variant="outline" size="sm" onClick={loadSample} className="text-xs">
-                                                Load Sample
-                                            </Button>
-                                            <Button variant="outline" size="sm" onClick={clearEditor} className="text-xs">
-                                                <X className="h-3 w-3 mr-1" />
-                                                Clear
-                                            </Button>
-                                        </div>
-                                    </div>
-
-                                    <Textarea
-                                        placeholder="Write or paste your markdown here..."
-                                        className="font-mono text-sm min-h-[60vh] sm:min-h-[70vh] resize-none focus-visible:ring-1"
-                                        value={markdown}
-                                        onChange={(e) => setMarkdown(e.target.value)}
-                                    />
-                                </TabsContent>
-
-                                <TabsContent value="preview" className="mt-0">
-                                    <div className="bg-white dark:bg-gray-950 p-4 sm:p-6 rounded-md border min-h-[60vh] sm:min-h-[70vh] prose prose-blue dark:prose-invert max-w-none overflow-auto">
-                                        <div dangerouslySetInnerHTML={{ __html: htmlOutput }} />
-                                    </div>
-                                </TabsContent>
-                            </CardContent>
-                        </Tabs>
-                    </Card>
-
-                    {/* Actions Sidebar */}
-                    <div className="lg:w-64 space-y-6">
-                        <Card>
-                            <CardHeader>
-                                <CardTitle className="text-lg">Export Options</CardTitle>
-                                <CardDescription>Get your content ready for Medium</CardDescription>
-                            </CardHeader>
-                            <CardContent className="space-y-4">
-                                <Button onClick={copyHtmlToClipboard} className="w-full flex items-center gap-2" disabled={!htmlOutput}>
-                                    <Copy className="h-4 w-4" />
-                                    {copied ? "Copied!" : "Copy HTML"}
-                                </Button>
-                                <Button onClick={downloadHtml} variant="outline" className="w-full flex items-center gap-2" disabled={!htmlOutput}>
-                                    <Download className="h-4 w-4" />
-                                    Download HTML
-                                </Button>
-                                <Button onClick={openNewPagePreview} variant="outline" className="w-full flex items-center gap-2" disabled={!htmlOutput}>
-                                    <Maximize className="h-4 w-4" />
-                                    Full Preview
-                                </Button>
-
-                                {tableHandlingMethod === 'gist' && tableData.length > 0 && (
-                                    <Button
-                                        onClick={openAllGistCreations}
-                                        variant="secondary"
-                                        className="w-full flex items-center gap-2"
-                                    >
-                                        <Github className="h-4 w-4" />
-                                        Create GitHub Gists
-                                    </Button>
-                                )}
-                            </CardContent>
-                        </Card>
-
-                        <Card>
-                            <CardHeader className="pb-2">
-                                <CardTitle className="text-lg">About</CardTitle>
-                            </CardHeader>
-                            <CardContent className="text-sm text-muted-foreground">
-                                <p className="mb-4">Convert Markdown to Medium-friendly HTML with proper styling and formatting.</p>
-                                <div className="flex items-center gap-2">
-                                    <Github className="h-4 w-4" />
-                                    <a href="https://github.com/Joel-hanson/markdown2medium" target="_blank" className="text-blue-600 hover:underline">View on GitHub</a>
-                                </div>
-                            </CardContent>
-                        </Card>
-                    </div>
+            <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-4 overflow-hidden px-4 py-4 sm:px-6 sm:py-5">
+                <div className="flex shrink-0 flex-wrap items-center gap-2">
+                    <Button
+                        size="sm"
+                        onClick={copyHtmlToClipboard}
+                        disabled={!markdown.trim() || isCopying}
+                        className="min-w-[10.25rem] transition-all duration-200"
+                    >
+                        {isCopying ? (
+                            <>
+                                <Loader2 className="animate-spin" />
+                                Copying…
+                            </>
+                        ) : copied ? (
+                            <>
+                                <Check className="animate-in zoom-in-50 duration-200" />
+                                Copied!
+                            </>
+                        ) : (
+                            <>
+                                <Copy />
+                                Copy for Medium
+                            </>
+                        )}
+                    </Button>
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={downloadHtml}
+                        disabled={!htmlOutput || isCopying}
+                    >
+                        <Download />
+                        Download HTML
+                    </Button>
+                    <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={openNewPagePreview}
+                        disabled={!htmlOutput || isCopying}
+                    >
+                        <Maximize />
+                        Full Preview
+                    </Button>
                 </div>
-            </main>
+
+                <div className="hidden min-h-0 flex-1 gap-4 lg:grid lg:grid-cols-2">
+                    {editorPane}
+                    {previewPane}
+                </div>
+
+                <div className="flex min-h-0 flex-1 flex-col lg:hidden">
+                    <Tabs value={mobileTab} onValueChange={setMobileTab} className="flex min-h-0 flex-1 flex-col">
+                        <TabsList className="mb-3 grid w-full shrink-0 grid-cols-2">
+                            <TabsTrigger value="editor">Markdown</TabsTrigger>
+                            <TabsTrigger value="preview">Preview</TabsTrigger>
+                        </TabsList>
+                        <TabsContent value="editor" className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden">
+                            <div className="flex h-full min-h-0 flex-col">{editorPane}</div>
+                        </TabsContent>
+                        <TabsContent value="preview" className="mt-0 min-h-0 flex-1 data-[state=inactive]:hidden">
+                            <div className="flex h-full min-h-0 flex-col">{previewPane}</div>
+                        </TabsContent>
+                    </Tabs>
+                </div>
+
+                <div className="shrink-0 space-y-3 border-t pt-3">
+                    <button
+                        type="button"
+                        onClick={() => setShowAdvanced((v) => !v)}
+                        className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors duration-200 hover:text-foreground"
+                    >
+                        <ChevronDown className={`h-4 w-4 transition-transform duration-300 ease-out ${showAdvanced ? 'rotate-180' : ''}`} />
+                        Advanced
+                    </button>
+                    <div
+                        className={`grid transition-[grid-template-rows,opacity] duration-300 ease-out ${
+                            showAdvanced ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'
+                        }`}
+                    >
+                        <div className="overflow-hidden">
+                            <Card className="max-w-xl shadow-sm">
+                                <CardContent className="space-y-6 p-4 sm:p-6">
+                                    <div>
+                                        <p className="mb-3 text-sm font-medium">Table handling</p>
+                                        <RadioGroup
+                                            value={tableMode}
+                                            onValueChange={(value) => setTableMode(value as TableMode)}
+                                            className="space-y-3"
+                                        >
+                                            <div className="flex items-start gap-3">
+                                                <RadioGroupItem value="plain" id="table-plain" className="mt-0.5" />
+                                                <div>
+                                                    <Label htmlFor="table-plain" className="cursor-pointer font-medium">
+                                                        Readable text
+                                                    </Label>
+                                                    <p className="text-sm text-muted-foreground">
+                                                        Preview and paste match. Stacked text that wraps on Medium.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            <div className="flex items-start gap-3">
+                                                <RadioGroupItem value="image" id="table-image" className="mt-0.5" />
+                                                <div>
+                                                    <Label htmlFor="table-image" className="cursor-pointer font-medium">
+                                                        Images
+                                                    </Label>
+                                                    <p className="text-sm text-muted-foreground">
+                                                        Preview and Download HTML show table images. Copy still pastes readable text.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            <div className="flex items-start gap-3">
+                                                <RadioGroupItem value="gist" id="table-gist" className="mt-0.5" />
+                                                <div>
+                                                    <Label htmlFor="table-gist" className="cursor-pointer font-medium">
+                                                        GitHub Gist
+                                                    </Label>
+                                                    <p className="text-sm text-muted-foreground">
+                                                        Preview shows placeholders. Use the helper to create embeds for Medium.
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </RadioGroup>
+                                        {tableMode === 'gist' && hasTables && (
+                                            <Button
+                                                variant="outline"
+                                                size="sm"
+                                                className="mt-3 animate-in fade-in duration-200"
+                                                onClick={openGistHelper}
+                                            >
+                                                <Github />
+                                                Open Gist helper
+                                            </Button>
+                                        )}
+                                    </div>
+
+                                    <Separator />
+
+                                    <div className="flex items-center gap-2">
+                                        <Switch
+                                            id="medium-classes"
+                                            checked={addMediumClasses}
+                                            onCheckedChange={setAddMediumClasses}
+                                        />
+                                        <Label htmlFor="medium-classes" className="cursor-pointer text-sm text-muted-foreground">
+                                            Medium CSS classes in preview HTML
+                                        </Label>
+                                    </div>
+                                </CardContent>
+                            </Card>
+                        </div>
+                    </div>
+                    <p className="text-sm text-muted-foreground">
+                        <a
+                            href="https://github.com/Joel-hanson/markdown2medium"
+                            target="_blank"
+                            rel="noreferrer"
+                            className="underline-offset-4 transition-colors hover:underline"
+                        >
+                            GitHub
+                        </a>
+                    </p>
+                </div>
+            </div>
         </div>
     );
 };

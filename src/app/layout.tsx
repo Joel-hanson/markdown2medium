@@ -1,3 +1,4 @@
+import { Toaster } from "@/components/ui/toaster";
 import { GoogleAnalytics } from '@next/third-parties/google';
 import { Analytics } from "@vercel/analytics/react";
 import type { Metadata } from "next";
@@ -8,7 +9,7 @@ const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
   title: 'Markdown to Medium Converter',
-  description: 'Convert Markdown to Medium-compatible HTML format',
+  description: 'Paste Markdown, copy, and paste into Medium with formatting preserved',
 };
 
 
@@ -21,6 +22,7 @@ export default function RootLayout({
     <html lang="en">
       <body className={inter.className}>
         {children}
+        <Toaster />
         <Analytics />
       </body>
       <GoogleAnalytics gaId="G-PFXTJDC8BE" />

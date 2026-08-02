@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 body {
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: inherit;
 }
 
 @layer base {
@@ -98,6 +98,18 @@ body {
 
 .graf--li {
   @apply list-disc ml-6 mb-2;
+}
+
+.table-row-label {
+  @apply font-semibold;
+}
+
+.table-row-label a {
+  @apply font-semibold underline underline-offset-2;
+}
+
+.image-missing {
+  @apply my-4 text-sm italic text-muted-foreground;
 }
 
 [data-radix-dialog-content] {
